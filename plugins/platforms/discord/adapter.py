@@ -7681,13 +7681,29 @@ class DiscordAdapter(BasePlatformAdapter):
             # We reserve one slot for the "Other" button, so cap at 24 choices.
             clean_choices = clean_choices[:24]
 
+            is_multi_select = False
+            if clean_choices:
+                try:
+                    from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
+                    clarify_entry = _clarify_entries.get(clarify_id)
+                    is_multi_select = bool(
+                        clarify_entry and getattr(clarify_entry, "multi_select", False)
+                    )
+                except Exception:
+                    is_multi_select = False
+
             if clean_choices:
                 embed.add_field(
                     name="Choices",
-                    value="Pick one below, or click ✏️ Other to type a custom answer.",
+                    value=(
+                        "Select all that apply below, or click ✏️ Other to type a custom answer."
+                        if is_multi_select
+                        else "Pick one below, or click ✏️ Other to type a custom answer."
+                    ),
                     inline=False,
                 )
-                view = ClarifyChoiceView(
+                view_cls = ClarifyMultiSelectView if is_multi_select else ClarifyChoiceView
+                view = view_cls(
                     choices=clean_choices,
                     clarify_id=clarify_id,
                     allowed_user_ids=self._allowed_user_ids,
@@ -7704,7 +7720,11 @@ class DiscordAdapter(BasePlatformAdapter):
             # Mirror the question in plain content — embeds are invisible on
             # some clients (see send_exec_approval).
             clarify_tail = (
-                "\n\nPick one below, or click ✏️ Other to type a custom answer."
+                (
+                    "\n\nSelect all that apply below, or click ✏️ Other to type a custom answer."
+                    if is_multi_select
+                    else "\n\nPick one below, or click ✏️ Other to type a custom answer."
+                )
                 if clean_choices
                 else "\n\nReply in this channel with your answer."
             )
@@ -8775,7 +8795,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ClarifyMultiSelectView, ChoicePickerView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -9806,6 +9826,128 @@ def _define_discord_view_classes() -> None:
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
+
+    class ClarifyMultiSelectView(ClarifyChoiceView):
+        """Discord dropdown for clarify prompts that allow multiple answers."""
+
+        def __init__(
+            self,
+            choices: List[str],
+            clarify_id: str,
+            allowed_user_ids: set,
+            allowed_role_ids: Optional[set] = None,
+        ):
+            super().__init__(
+                choices=choices,
+                clarify_id=clarify_id,
+                allowed_user_ids=allowed_user_ids,
+                allowed_role_ids=allowed_role_ids,
+            )
+            self.clear_items()
+
+            options = []
+            for index, choice in enumerate(self.choices):
+                label = _prefix_within_utf16_limit(choice, 100).rstrip()
+                if utf16_len(label) < utf16_len(choice):
+                    label = _prefix_within_utf16_limit(
+                        label, 100 - utf16_len(_DISCORD_ELLIPSIS)
+                    ).rstrip() + _DISCORD_ELLIPSIS
+                options.append(
+                    discord.SelectOption(label=label or str(index + 1), value=str(index))
+                )
+
+            self.select = discord.ui.Select(
+                placeholder="Select all that apply",
+                options=options,
+                min_values=1,
+                max_values=len(options),
+                custom_id=f"clarify:{clarify_id}:multi",
+            )
+            self.select.callback = self._on_select
+            self.add_item(self.select)
+
+            other_btn = discord.ui.Button(
+                label="✏️ Other (type answer)",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"clarify:{clarify_id}:other",
+            )
+            other_btn.callback = self._on_other
+            self.add_item(other_btn)
+
+        async def _on_select(self, interaction: "discord.Interaction") -> None:
+            if self.resolved:
+                await interaction.response.send_message(
+                    "This prompt has already been answered~", ephemeral=True,
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to answer this prompt~", ephemeral=True,
+                )
+                return
+
+            selected = []
+            for raw_index in getattr(self.select, "values", []):
+                try:
+                    index = int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= index < len(self.choices):
+                    selected.append(self.choices[index])
+            if not selected:
+                await interaction.response.send_message(
+                    "Select at least one option~", ephemeral=True,
+                )
+                return
+
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+
+            embed = interaction.message.embeds[0] if (
+                interaction.message and interaction.message.embeds
+            ) else None
+            if embed:
+                user = getattr(interaction, "user", None)
+                display_name = getattr(user, "display_name", "user")
+                summary = ", ".join(selected)
+                if len(summary) > 850:
+                    summary = summary[:847] + "..."
+                embed.color = discord.Color.green()
+                embed.set_footer(text=f"Answered by {display_name}: {summary}")
+
+            try:
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception:
+                logger.debug(
+                    "Discord multi-select clarify edit_message failed for %s",
+                    self.clarify_id,
+                    exc_info=True,
+                )
+                try:
+                    await interaction.response.defer()
+                except Exception:
+                    pass
+
+            try:
+                from tools.clarify_gateway import resolve_gateway_clarify
+                resolved = resolve_gateway_clarify(
+                    self.clarify_id,
+                    json.dumps(selected, ensure_ascii=False),
+                )
+                logger.info(
+                    "Discord multi-select clarify resolved (id=%s, choices=%r, user=%s, ok=%s)",
+                    self.clarify_id,
+                    selected,
+                    getattr(getattr(interaction, "user", None), "display_name", "?"),
+                    resolved,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Discord multi-select clarify resolution failed (id=%s): %s",
+                    self.clarify_id,
+                    exc,
+                )
 if DISCORD_AVAILABLE:
     _define_discord_view_classes()
 

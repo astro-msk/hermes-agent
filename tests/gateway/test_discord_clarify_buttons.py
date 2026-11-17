@@ -11,6 +11,7 @@ dispatcher like Telegram — the auth + resolution path is the same:
   · already-resolved or unauthorized → ephemeral "this prompt..." reply
 """
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -232,6 +233,49 @@ class TestDiscordSendClarify:
         assert isinstance(kwargs["view"], ClarifyChoiceView)
         # 3 choice buttons + 1 Other
         assert len(kwargs["view"].children) == 4
+
+    @pytest.mark.asyncio
+    async def test_multi_select_uses_dropdown_and_resolves_all_choices(self):
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "cidMS",
+            "sk-MS",
+            "Pick every completed habit",
+            ["Yoga", "Walk", "Oats"],
+            multi_select=True,
+        )
+        adapter = _make_adapter(allowed_users={"42"})
+        channel = MagicMock()
+        sent_msg = MagicMock()
+        sent_msg.id = 654321
+        channel.send = AsyncMock(return_value=sent_msg)
+        adapter._client.get_channel = MagicMock(return_value=channel)
+
+        result = await adapter.send_clarify(
+            chat_id="9001",
+            question="Pick every completed habit",
+            choices=["Yoga", "Walk", "Oats"],
+            clarify_id="cidMS",
+            session_key="sk-MS",
+        )
+
+        assert result.success is True
+        view = channel.send.call_args.kwargs["view"]
+        select = view.children[0]
+        assert select.min_values == 1
+        assert select.max_values == 3
+        assert [option.label for option in select.options] == ["Yoga", "Walk", "Oats"]
+
+        select.values = ["0", "2"]
+        interaction = _make_interaction(user_id="42")
+        await select.callback(interaction)
+
+        assert json.loads(cm.wait_for_response("cidMS", timeout=0.01)) == [
+            "Yoga",
+            "Oats",
+        ]
+        assert all(child.disabled for child in view.children)
 
     @pytest.mark.asyncio
     async def test_open_ended_omits_view(self):
